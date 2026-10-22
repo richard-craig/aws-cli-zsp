@@ -7,8 +7,6 @@ Unlock AWS key 'prod' for a 15-minute WRITE session.
 Requested by: aws s3 rm s3://prod-backups --recursive --profile prod-write ← pwsh
 ```
 
-If you didn't type that, press Cancel.
-
 A Windows port and extension of Andrew Baker's macOS [aws-cli-zsp](https://andrewbaker.ninja/2026/10/20/aws-cli-zsp-zero-standing-permissions-for-aws-keys-on-your-mac/): the Secure Enclave becomes the TPM, Touch ID becomes Windows Hello. It adds a service mode that keeps your keys out of reach of malware running as you.
 
 ## How it works
