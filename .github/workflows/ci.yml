@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet (linux, windows/amd64, windows/arm64)
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+      - name: test (engine, broker protocol, guard, tiers, shipping; software key stand-ins)
+        run: go test -race -count=1 ./...
+      - name: build windows binaries
+        run: ./scripts/build.sh ci
+      - name: lint CloudFormation templates
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint deploy/*.yaml
+
+  windows-smoke:
+    # Builds and runs the CLI on a real Windows runner (no Windows Hello there,
+    # so only commands that need no key are exercised).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - shell: pwsh
+        run: |
+          go build -trimpath -o zsp.exe .
+          go build -trimpath -ldflags "-H=windowsgui" -o zspw.exe .
+          ./zsp.exe version
+          ./zsp.exe help | Select-Object -First 5
+          ./zsp.exe service status

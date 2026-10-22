@@ -1,0 +1,69 @@
+name: release
+
+# Push a tag like v1.0.0. The binaries are built from that tag on GitHub-hosted
+# runners, uploaded unsigned, signed by SignPath Foundation (free code signing
+# for open source), and attached to a GitHub Release with SHA-256 sums.
+#
+# Repository settings needed (see docs/SIGNING.md):
+#   secret   SIGNPATH_API_TOKEN
+#   variable SIGNPATH_ORGANIZATION_ID
+#   variable SIGNPATH_PROJECT_SLUG          (default: aws-cli-zsp)
+#   variable SIGNPATH_SIGNING_POLICY_SLUG   (default: release-signing)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - run: go vet ./... && go test -count=1 ./...
+      - run: ./scripts/build.sh "${{ steps.ver.outputs.version }}"
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-cli-zsp-unsigned
+          path: dist/
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'aws-cli-zsp' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: default
+          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+      - name: checksums
+        run: |
+          cd signed
+          sha256sum */*.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          for a in amd64 arm64; do (cd "$a" && zip -q "../aws-cli-zsp-windows-${{ needs.build.outputs.version }}-$a.zip" zsp.exe zspw.exe); done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            signed/*.zip
+            signed/SHA256SUMS.txt
+          generate_release_notes: true

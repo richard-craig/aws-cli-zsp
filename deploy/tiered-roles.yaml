@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  aws-cli-zsp v0.3 tiered access. Creates a read role and a write role that only
+  the named IAM user can assume (with MFA, from zsp-named sessions), and lets that
+  user attach the zsp revoke / source-IP deny policies to the two roles. Each role
+  carries a permissions boundary equal to its permissions, so an inline policy the
+  user adds can only ever restrict, never widen, what the role can do.
+
+Parameters:
+  ZspUserName:
+    Type: String
+    Description: IAM user whose access key is sealed in aws-cli-zsp (e.g. richard).
+    AllowedPattern: "[\\w+=,.@-]+"
+  ReadPolicyArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/ReadOnlyAccess
+    Description: Managed policy for the read tier (also its permissions boundary).
+  WritePolicyArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/PowerUserAccess
+    Description: >
+      Managed policy for the write tier (also its permissions boundary).
+      PowerUserAccess excludes IAM; use AdministratorAccess only if you must.
+  RequireMFA:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Require MFA to assume either role (needs `zsp mfa enable` first).
+  ReadMaxSessionSeconds:
+    Type: Number
+    Default: 43200
+    MinValue: 3600
+    MaxValue: 43200
+    Description: Longest read session the role allows (zsp asks for its own, shorter, length).
+  WriteMaxSessionSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 3600
+    MaxValue: 43200
+    Description: Longest write session the role allows (zsp defaults to 15 minutes).
+  AllowedCidrs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional. Deny all use of zsp sessions of these roles from outside these
+      networks (e.g. 196.25.1.0/24,41.0.0.10/32). Leave empty for no binding.
+
+Conditions:
+  MFA: !Equals [!Ref RequireMFA, "true"]
+  HasCidrs: !Not [!Equals [!Join ["", !Ref AllowedCidrs], ""]]
+
+Resources:
+  ReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "zsp-read-${ZspUserName}"
+      Description: !Sub "aws-cli-zsp read tier for ${ZspUserName}"
+      MaxSessionDuration: !Ref ReadMaxSessionSeconds
+      ManagedPolicyArns: [!Ref ReadPolicyArn]
+      PermissionsBoundary: !Ref ReadPolicyArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${ZspUserName}" }
+            Action: sts:AssumeRole
+            Condition: !If
+              - MFA
+              - Bool: { "aws:MultiFactorAuthPresent": "true" }
+                StringLike: { "sts:RoleSessionName": !Sub "zsp-${ZspUserName}-*" }
+              - StringLike: { "sts:RoleSessionName": !Sub "zsp-${ZspUserName}-*" }
+
+  WriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "zsp-write-${ZspUserName}"
+      Description: !Sub "aws-cli-zsp write tier for ${ZspUserName}"
+      MaxSessionDuration: !Ref WriteMaxSessionSeconds
+      ManagedPolicyArns: [!Ref WritePolicyArn]
+      PermissionsBoundary: !Ref WritePolicyArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${ZspUserName}" }
+            Action: sts:AssumeRole
+            Condition: !If
+              - MFA
+              - Bool: { "aws:MultiFactorAuthPresent": "true" }
+                StringLike: { "sts:RoleSessionName": !Sub "zsp-${ZspUserName}-*" }
+              - StringLike: { "sts:RoleSessionName": !Sub "zsp-${ZspUserName}-*" }
+
+  SourceIpBinding:
+    Type: AWS::IAM::RolePolicy
+    Condition: HasCidrs
+    Properties:
+      RoleName: !Ref ReadRole
+      PolicyName: !Sub "aws-cli-zsp-source-ip-${ZspUserName}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyZspSessionsOutsideAllowedNetworks
+            Effect: Deny
+            Action: "*"
+            Resource: "*"
+            Condition:
+              NotIpAddress: { "aws:SourceIp": !Ref AllowedCidrs }
+              BoolIfExists: { "aws:ViaAWSService": "false" }
+
+  SourceIpBindingWrite:
+    Type: AWS::IAM::RolePolicy
+    Condition: HasCidrs
+    Properties:
+      RoleName: !Ref WriteRole
+      PolicyName: !Sub "aws-cli-zsp-source-ip-${ZspUserName}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyZspSessionsOutsideAllowedNetworks
+            Effect: Deny
+            Action: "*"
+            Resource: "*"
+            Condition:
+              NotIpAddress: { "aws:SourceIp": !Ref AllowedCidrs }
+              BoolIfExists: { "aws:ViaAWSService": "false" }
+
+  # What the zsp user itself needs: assume the two roles, and manage the zsp
+  # deny policies on them (`zsp revoke`, `zsp netbind`). The permissions
+  # boundaries above mean a policy put here can only restrict the role.
+  ZspUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: aws-cli-zsp-tiers
+      Users: [!Ref ZspUserName]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeZspTiers
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource: [!GetAtt ReadRole.Arn, !GetAtt WriteRole.Arn]
+          - Sid: ManageZspDenyPolicies
+            Effect: Allow
+            Action: [iam:PutRolePolicy, iam:DeleteRolePolicy, iam:GetRolePolicy]
+            Resource: [!GetAtt ReadRole.Arn, !GetAtt WriteRole.Arn]
+          - Sid: NeverTouchTheBoundaries
+            Effect: Deny
+            Action: [iam:DeleteRolePermissionsBoundary, iam:PutRolePermissionsBoundary, iam:AttachRolePolicy,
+                     iam:DetachRolePolicy, iam:UpdateAssumeRolePolicy, iam:DeleteRole, iam:UpdateRole]
+            Resource: [!GetAtt ReadRole.Arn, !GetAtt WriteRole.Arn]
+
+Outputs:
+  ReadRoleArn:
+    Value: !GetAtt ReadRole.Arn
+  WriteRoleArn:
+    Value: !GetAtt WriteRole.Arn
+  ZspCommand:
+    Description: Run this on the PC (replace PROFILE with the zsp profile name).
+    Value: !Sub "zsp tier set --profile PROFILE --read-role ${ReadRole.Arn} --write-role ${WriteRole.Arn}"

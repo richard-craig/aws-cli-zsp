@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  aws-cli-zsp v0.3 auto-revoke. Watches CloudTrail (via EventBridge) for API calls
+  made with a zsp session from outside your networks. When it sees one, it
+  attaches the same "deny tokens issued before now" policy that `zsp revoke`
+  uses, so a stolen session dies within about a minute, then notifies you.
+  Deploy in us-east-1 (IAM and global STS events arrive there) AND in every
+  region you use (a StackSet is the easy way).
+
+Parameters:
+  WatchedUserNames:
+    Type: CommaDelimitedList
+    Description: IAM users whose keys are sealed in aws-cli-zsp (e.g. richard,thandi).
+  AllowedCidrs:
+    Type: CommaDelimitedList
+    Description: Networks your zsp sessions legitimately come from (office, VPN egress, home).
+  NotifyEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for revoke notifications (confirm the SNS subscription).
+  IncludeReadOnlyEvents:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Also act on read-only calls (Get/List/Describe). Most stolen-token abuse
+      starts with reads; this costs more EventBridge events.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotifyEmail, ""]]
+  ReadOnlyToo: !Equals [!Ref IncludeReadOnlyEvents, "true"]
+
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-cli-zsp-auto-revoke
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: email
+      Endpoint: !Ref NotifyEmail
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: revoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PutUserPolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+              - Effect: Allow
+                Action: iam:PutRolePolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Topic
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-cli-zsp-auto-revoke
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt FunctionRole.Arn
+      Environment:
+        Variables:
+          WATCHED_USERS: !Join [",", !Ref WatchedUserNames]
+          ALLOWED_CIDRS: !Join [",", !Ref AllowedCidrs]
+          TOPIC_ARN: !Ref Topic
+      Code:
+        ZipFile: |
+          import datetime, ipaddress, json, os
+          import boto3
+
+          iam = boto3.client("iam")
+          sns = boto3.client("sns")
+          USERS = [u.strip() for u in os.environ["WATCHED_USERS"].split(",") if u.strip()]
+          NETS = [ipaddress.ip_network(c.strip(), strict=False)
+                  for c in os.environ["ALLOWED_CIDRS"].split(",") if c.strip()]
+
+          def deny_before(now, user=None):
+              cond = {"DateLessThan": {"aws:TokenIssueTime": now}}
+              if user:  # role: only this user's zsp sessions, never other users of the role
+                  cond["StringLike"] = {"aws:userid": "*:zsp-%s-*" % user}
+              return json.dumps({"Version": "2012-10-17", "Statement": [{
+                  "Sid": "AutoRevokedByZsp", "Effect": "Deny", "Action": "*",
+                  "Resource": "*", "Condition": cond}]})
+
+          def handler(event, _ctx):
+              d = event.get("detail", {})
+              ui = d.get("userIdentity", {})
+              src = d.get("sourceIPAddress", "")
+              try:
+                  ip = ipaddress.ip_address(src)
+              except ValueError:
+                  return "service principal"          # e.g. cloudformation.amazonaws.com
+              if any(ip in n for n in NETS):
+                  return "allowed network"
+              now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              typ = ui.get("type")
+              if typ == "IAMUser" and ui.get("userName") in USERS and ui.get("accessKeyId", "").startswith("ASIA"):
+                  user = ui["userName"]
+                  iam.put_user_policy(UserName=user, PolicyName="aws-cli-zsp-revoke-older-sessions",
+                                      PolicyDocument=deny_before(now))
+                  target = "IAM user %s" % user
+              elif typ == "AssumedRole":
+                  session = ui.get("arn", "").rsplit("/", 1)[-1]
+                  user = next((u for u in USERS if session.startswith("zsp-%s-" % u)), None)
+                  if not user:
+                      return "not a zsp session"
+                  role = ui.get("sessionContext", {}).get("sessionIssuer", {}).get("userName")
+                  iam.put_role_policy(RoleName=role, PolicyName="aws-cli-zsp-revoke-older-sessions-%s" % user,
+                                      PolicyDocument=deny_before(now, user))
+                  target = "role %s (zsp sessions of %s)" % (role, user)
+              else:
+                  return "not watched"
+              msg = ("aws-cli-zsp auto-revoke: %s called %s:%s from %s (outside %s). "
+                     "Every session issued before %s is now denied. "
+                     "If this was you on a new network, add it to AllowedCidrs; otherwise run `zsp rotate`."
+                     % (target, d.get("eventSource"), d.get("eventName"), src, os.environ["ALLOWED_CIDRS"], now))
+              print(msg)
+              sns.publish(TopicArn=os.environ["TOPIC_ARN"], Subject="aws-cli-zsp: stolen session revoked", Message=msg)
+              return "revoked"
+
+  Rule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: API calls made with temporary credentials (zsp sessions are always temporary)
+      State: !If [ReadOnlyToo, ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS, ENABLED]
+      EventPattern:
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          userIdentity:
+            accessKeyId: [{ prefix: "ASIA" }]
+      Targets:
+        - Arn: !GetAtt Function.Arn
+          Id: zsp-auto-revoke
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Rule.Arn
+
+Outputs:
+  TopicArn:
+    Value: !Ref Topic
