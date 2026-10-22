@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for aws-cli-zsp.
+  Paste this as the project's "default" artifact configuration in SignPath.
+  The GitHub workflow uploads dist/ (zipped by actions/upload-artifact), which
+  contains amd64/ and arm64/, each with the console client and the watcher.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <directory path="amd64">
+      <pe-file path="zsp.exe">
+        <authenticode-sign/>
+      </pe-file>
+      <pe-file path="zspw.exe">
+        <authenticode-sign/>
+      </pe-file>
+    </directory>
+    <directory path="arm64">
+      <pe-file path="zsp.exe">
+        <authenticode-sign/>
+      </pe-file>
+      <pe-file path="zspw.exe">
+        <authenticode-sign/>
+      </pe-file>
+    </directory>
+  </zip-file>
+</artifact-configuration>

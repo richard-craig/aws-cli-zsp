@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  aws-cli-zsp v0.2 off-box audit. An S3 bucket with Object Lock in COMPLIANCE
+  mode (nothing shipped can be changed or deleted until retention ends, not even
+  by the account root) and an IAM user that may only add objects under one
+  prefix. Put this in a separate log-archive account if you have one.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique, lowercase, no dots (dots break TLS for virtual-hosted S3).
+    AllowedPattern: "[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"
+  RetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    Description: How long every audit object is immutable.
+  Prefix:
+    Type: String
+    Default: aws-cli-zsp
+    AllowedPattern: "[A-Za-z0-9._/-]+"
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: !Ref RetentionDays
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  Shipper:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "aws-cli-zsp-audit-shipper-${AWS::Region}"
+      Policies:
+        - PolicyName: put-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AppendOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${Bucket.Arn}/${Prefix}/*"
+              - Sid: NoRetentionTricks
+                Effect: Deny
+                Action: [s3:PutObjectRetention, s3:PutObjectLegalHold, s3:BypassGovernanceRetention, s3:DeleteObject, s3:DeleteObjectVersion]
+                Resource: !Sub "${Bucket.Arn}/*"
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  ShipperUser:
+    Value: !Ref Shipper
+  NextSteps:
+    Value: !Sub >
+      aws iam create-access-key --user-name ${Shipper}   then on each PC:
+      zsp ship setup --bucket ${Bucket} --region ${AWS::Region} --prefix ${Prefix}
+      (paste the key id and secret when asked; zsp seals them, do not keep a copy)

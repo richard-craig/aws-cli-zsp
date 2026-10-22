@@ -1,0 +1,5 @@
+dist/
+*.exe
+*.test
+/zsp
+aws-cli-zsp-report-*.txt
