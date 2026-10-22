@@ -1,10 +1,10 @@
 # aws-cli-zsp for Windows
 
-**Zero Standing Permissions for the AWS keys on your PC.** No readable key in `~/.aws`. Every session expires on its own. Windows Hello approves each one, and the prompt names the key, how long, and which command asked.
+**Zero Standing Permissions for the AWS keys on your PC.** No readable key in `~/.aws`. Every session expires on its own. Windows Hello approves each one, and the prompt names the key, the access level, how long, and which command asked (and from which program).
 
 ```
-Unlock AWS key 'prod' for a 1-hour READ-ONLY session.
-Requested by: aws s3 rm s3://prod-backups --recursive ← pwsh
+Unlock AWS key 'prod' for a 15-minute WRITE session.
+Requested by: aws s3 rm s3://prod-backups --recursive --profile prod-write ← pwsh
 ```
 
 If you didn't type that, press Cancel.
